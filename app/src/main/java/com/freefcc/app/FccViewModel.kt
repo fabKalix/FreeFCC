@@ -33,6 +33,8 @@ data class AppState(
     val isHardwareBusy: Boolean = false,
     val busyProgress: Float = 0f,
     val aircraftSerial: String = "",
+    val manualSerial: String = "",
+    val isProbingSerial: Boolean = false,
     val controllerModel: String = "",
     val deviceInfo: String = "",
     val isQueryingInfo: Boolean = false,
@@ -65,7 +67,28 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.4.7"
+        const val APP_VERSION = "1.5.5"
+
+        /**
+         * Aircraft model codes *hinted* to support the DJI Cellular Dongle 2 / 4G.
+         *
+         * This is ADVISORY ONLY — it is not a hard gate. Two reasons:
+         *  1. It cannot be applied reliably. probeSerial() usually returns the
+         *     full 1581… factory serial, which does not contain a W[AM]xxx model
+         *     code at all, so there is nothing here to match against.
+         *  2. The codes themselves are uncertain. Public sources disagree on what
+         *     wa233/wa234 map to, and DJI ships the Cellular Dongle 2 for the
+         *     Mini 4 Pro (wa140) with a mounting kit — contrary to the old
+         *     assumption that the Mini series has no cellular option.
+         *     Source: DJI Cellular Dongle 2 listed compatibility — Air 3,
+         *     Air 3S, Mini 4 Pro, Matrice 4T, Matrice 4E.
+         *
+         * The authoritative "can this aircraft do 4G" signal is
+         * DumlTransport.is4gDonglePresent(): if the /duss/mb/0x205 socket is
+         * connectable, a cellular module is attached. That is what actually
+         * gates activation. This set only lets us log a helpful note.
+         */
+        private val MODELS_WITH_4G = setOf("wa341", "wa233", "wa234", "wm630", "wa140")
     }
 
     private val _state = MutableStateFlow(AppState())
@@ -80,6 +103,30 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         // ViewModel instance — the collector must live here, not in init().
         viewModelScope.launch {
             HardwareLock.busy.collect { busy -> update { copy(isHardwareBusy = busy) } }
+        }
+        // Restore the cached aircraft serial from a previous session so the
+        // user does not have to re-probe before 4G if the drone is the same.
+        // A manually-entered serial takes priority and is shown in the field.
+        val manual = prefs.getString("manual_aircraft_sn", "").orEmpty()
+        val cachedSerial = prefs.getString("aircraft_serial", "").orEmpty()
+        val shown = if (manual.isNotEmpty()) manual else cachedSerial
+        update { copy(manualSerial = manual, aircraftSerial = shown) }
+    }
+
+    /**
+     * Stores (or clears) a manually-entered aircraft serial. A manual serial
+     * takes priority over auto-detection everywhere — the reliable fallback
+     * when the controller never surfaces the serial on its own.
+     */
+    fun setManualSerial(serial: String) {
+        val s = serial.trim().uppercase()
+        prefs.edit().putString("manual_aircraft_sn", s).apply()
+        if (s.isEmpty()) {
+            update { copy(manualSerial = "") }
+            log("Manual serial cleared — auto-detection will be used")
+        } else {
+            update { copy(manualSerial = s, aircraftSerial = s) }
+            log(if (DumlTransport.isValidSerial(s)) "Manual serial set: $s" else "Manual serial set: $s (note: unusual format)")
         }
     }
 
@@ -148,6 +195,9 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
                     log("DUML port detected: $detectedPort")
                 }
                 val serial = transport.probeSerial(1500)
+                if (serial.isNotEmpty()) {
+                    prefs.edit().putString("aircraft_serial", serial).apply()
+                }
                 update {
                     copy(
                         status = "connected",
@@ -240,6 +290,9 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
                         log("DUML port detected: $detectedPort")
                     }
                     val serial = transport.probeSerial(1500)
+                    if (serial.isNotEmpty()) {
+                        prefs.edit().putString("aircraft_serial", serial).apply()
+                    }
                     update {
                         copy(
                             status = "connected",
@@ -451,6 +504,19 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
      * The socket does not respond, so this can only confirm the frames were
      * written — never confirm the aircraft actually activated 4G. There is
      * no "off" action: no send-only command exists to reliably deactivate it.
+     *
+     * Guards (fail fast on the common failure modes, but do not over-block):
+     * 1. Aircraft serial must be present — it is embedded in every 4G payload.
+     *    We do not reject on a specific length: the probe may return either the
+     *    full 1581… factory serial or a short W[AM]xxx model code, and both are
+     *    valid inputs to the profile builder.
+     * 2. The 4G dongle must be present — this is the AUTHORITATIVE gate. If the
+     *    abstract socket `/duss/mb/0x205` is not connectable, no cellular module
+     *    is attached and no frame can succeed, so we stop before writing 128.
+     * 3. Model code is only an advisory note. A full 1581… serial carries no
+     *    model code to check, and the code list is not reliable enough to block
+     *    on (DJI ships the Cellular Dongle 2 for the Mini 4 Pro too). If the
+     *    dongle is attached, we proceed regardless of model.
      */
     fun send4gActivationFrames() {
         if (!beginHardwareOp()) {
@@ -463,16 +529,37 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         runOnIO {
             try {
                 val serial = getOrProbeSerial()
+
+                // Guard 1: we need *some* serial to embed in the payload.
                 if (serial.isEmpty()) {
                     update {
-                        copy(is4gBusy = false, fourGMessage = "4G needs the aircraft connected. Power on the drone and try again.")
+                        copy(is4gBusy = false, fourGMessage = "4G needs the aircraft connected. Power on the drone, link it, and tap Connect first.")
                     }
-                    log("4G activation failed — no aircraft serial")
+                    log("4G activation failed — no aircraft serial detected; power on the drone and tap Connect first")
+                    return@runOnIO
+                }
+
+                // Advisory only: pull a W[AM]xxx model code from anywhere in the
+                // serial (a full 1581… serial won't contain one). Never blocks —
+                // the dongle probe below is the real gate.
+                val modelHint = Regex("[wW][aAmM][0-9]{3}").find(serial)?.value?.lowercase()
+                if (modelHint != null && modelHint !in MODELS_WITH_4G) {
+                    log("Note: model '$modelHint' isn't in the known-4G list, but a dongle check follows — trying anyway. If 4G doesn't activate, this aircraft may not accept the Cellular Dongle 2.")
+                }
+
+                // Guard 2 (authoritative): dongle pre-check. If the socket isn't
+                // connectable, no cellular module is attached — stop before
+                // writing 128 frames that cannot succeed.
+                if (!transport.is4gDonglePresent()) {
+                    update {
+                        copy(is4gBusy = false, fourGMessage = "4G dongle not detected. Connect a DJI Cellular Dongle 2 to the aircraft (Mini 4 Pro also needs its 4G mounting kit) and try again.")
+                    }
+                    log("4G activation aborted — 4G socket /duss/mb/0x205 not connectable (no dongle?)")
                     return@runOnIO
                 }
 
                 val profile = Profiles.load4g(app, serial)
-                log("Loaded 4G profile: ${profile.frames.size} frames (serial: $serial)")
+                log("Loaded 4G profile: ${profile.frames.size} frames (serial: $serial, model: ${modelHint ?: "unknown"})")
 
                 // 4G uses Unix domain socket, not TCP
                 val success = transport.sendFramesUnix(
@@ -508,13 +595,25 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
      * Turns the aircraft arm LEDs on or off.
      * Uses port 40007 (different from the standard 40009 DUML port).
      * Requires DJI Fly running with the aircraft connected.
-     * Sends the command twice with a 500ms delay for reliability.
+     *
+     * Sends the LED command in 2 bursts of 5 writes each (10 total), with
+     * 100ms between writes — matching the reference app's pattern for
+     * reliability.
+     *
+     * **Does NOT hold HardwareLock.** The LED command targets port 40007
+     * (camera/LED subsystem) while the FCC keepalive targets port 40009
+     * (radio subsystem). They use different ports and different subsystems,
+     * so they can run concurrently without conflict. Holding the lock during
+     * the LED command would block the keepalive for ~1.5s, creating a gap
+     * where DJI Fly could reset the radio to CE. By not holding the lock,
+     * the keepalive continues re-applying FCC throughout the LED command.
+     * Only the [isLedBusy] UI flag prevents double-taps.
      *
      * @param on true for LED ON, false for LED OFF
      */
     fun setLed(on: Boolean) {
-        if (!beginHardwareOp()) {
-            log("Hardware busy — please wait for the current operation to finish.")
+        if (_state.value.isLedBusy) {
+            log("LED busy — please wait.")
             return
         }
         update { copy(isLedBusy = true, ledStatus = if (on) "Turning LEDs on..." else "Turning LEDs off...") }
@@ -526,20 +625,24 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
                 val profile = Profiles.load(app, fileName)
                 log("Loaded LED profile: ${profile.frames.size} frames (port ${profile.port})")
 
+                // Separate transport instance — the LED command on port 40007
+                // must not share state with the FCC transport on port 40009.
+                val ledTransport = DumlTransport()
+
                 var anySuccess = false
 
-                // Send the LED command twice with a 500ms delay for reliability
+                // 2 connection bursts × 5 writes each = 10 total sends, with
+                // 100ms between writes and 100ms between bursts. Matches the
+                // reference app's reliability pattern.
                 for (attempt in 0 until 2) {
-                    if (attempt > 0) {
-                        delay(500)
-                    }
+                    if (attempt > 0) delay(100)
 
-                    val success = transport.sendFrames(
+                    val success = ledTransport.sendFrames(
                         frames = profile.frames,
-                        rounds = profile.rounds,
-                        interFrameDelayMs = profile.interFrameDelay,
-                        interRoundDelayMs = profile.interRoundDelay,
-                        readWindowMs = profile.readWindowMs,
+                        rounds = 5,
+                        interFrameDelayMs = 100,
+                        interRoundDelayMs = 0,
+                        readWindowMs = 100,
                         port = profile.port
                     )
 
@@ -556,8 +659,6 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 log("LED error: ${e.message}")
                 update { copy(isLedBusy = false, ledStatus = "Error: ${e.message}") }
-            } finally {
-                endHardwareOp()
             }
         }
     }
@@ -614,17 +715,26 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
             log("Hardware busy — please wait for the current operation to finish.")
             return
         }
-        log("Probing for aircraft serial...")
+        log("Reading aircraft serial...")
+        update { copy(isProbingSerial = true) }
         runOnIO {
             try {
-                val serial = transport.probeSerial(2000)
+                // Active query first (fast, deterministic when the aircraft is
+                // linked), then a longer passive telemetry listen as a fallback.
+                var serial = transport.probeSerialActive(800)
+                if (serial.isEmpty()) {
+                    log("No reply to the serial query — listening for telemetry (up to 8s)...")
+                    serial = transport.probeSerial(8000)
+                }
                 if (serial.isNotEmpty()) {
                     update { copy(aircraftSerial = serial) }
-                    log("Aircraft serial: $serial")
+                    prefs.edit().putString("aircraft_serial", serial).apply()
+                    log("Aircraft serial: $serial (cached)")
                 } else {
-                    log("No serial detected — is the aircraft powered on?")
+                    log("No serial detected — power on and link the aircraft with the live view up, or enter it manually.")
                 }
             } finally {
+                update { copy(isProbingSerial = false) }
                 endHardwareOp()
             }
         }
@@ -632,25 +742,30 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     // --- Updates ---
 
-    fun checkForUpdates() {
+    fun checkForUpdates(force: Boolean = false) {
         // Rate-limit: don't hit GitHub API more than once per hour.
         // Unauthenticated limit is 60 requests/hour per IP.
+        // The timestamp is saved ONLY on success — a failed check does NOT
+        // consume the rate-limit window, so the user can retry immediately.
         val lastCheck = prefs.getLong("last_update_check", 0)
         val now = System.currentTimeMillis()
-        if (now - lastCheck < 60 * 60 * 1000 && _state.value.updateChecked) {
+        if (!force && now - lastCheck < 60 * 60 * 1000 && _state.value.updateChecked && _state.value.updateInfo != null) {
             return
         }
-        prefs.edit().putLong("last_update_check", now).apply()
         update { copy(isCheckingUpdate = true) }
         log("Checking for updates...")
 
         runOnIO {
             val info = UpdateChecker.fetchLatest()
             if (info == null) {
+                // Don't save lastCheck on failure — let the user retry immediately.
                 update { copy(isCheckingUpdate = false, updateChecked = true) }
-                log("Update check failed — no internet or GitHub unreachable")
+                log("Update check failed — no internet or GitHub unreachable. Tap Retry to try again.")
                 return@runOnIO
             }
+
+            // Save the timestamp only on success.
+            prefs.edit().putLong("last_update_check", System.currentTimeMillis()).apply()
 
             val isNewer = info.isNewerThan(APP_VERSION)
             update {
@@ -671,9 +786,40 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     private var downloadedApk: java.io.File? = null
 
+    /**
+     * Checks if the app can install packages. If not, opens the system
+     * Settings page for "Install unknown apps" so the user can grant it.
+     * Returns true if permission is already granted (proceed with download),
+     * false if we opened Settings (user needs to grant, then tap Download again).
+     */
+    fun ensureInstallPermission(): Boolean {
+        val pm = app.packageManager
+        if (android.os.Build.VERSION.SDK_INT >= 26 && !pm.canRequestPackageInstalls()) {
+            log("Install permission needed — opening Settings. Grant 'Install unknown apps' for FreeFCC, then tap Download again.")
+            val settingsIntent = android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES
+            ).apply {
+                data = android.net.Uri.parse("package:${app.packageName}")
+                flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            try {
+                app.startActivity(settingsIntent)
+            } catch (_: Exception) {
+                log("Settings page not available — you may need to install updates via SD card + FileManager.")
+            }
+            return false
+        }
+        return true
+    }
+
     fun downloadUpdate() {
         val info = _state.value.updateInfo ?: return
         if (_state.value.isDownloadingUpdate) return
+        // Check install permission BEFORE downloading so the user can grant
+        // it first, then come back and tap Download again.
+        if (!ensureInstallPermission()) {
+            return
+        }
         update { copy(isDownloadingUpdate = true, updateDownloadProgress = 0f, isUpdateDownloaded = false) }
         log("Downloading update v${info.version}...")
 
@@ -684,7 +830,7 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
             if (file == null) {
                 update { copy(isDownloadingUpdate = false, updateDownloadProgress = 0f) }
-                log("Update download failed — check your internet connection")
+                log("Update download failed — check your Wi-Fi connection. The RC2 needs Wi-Fi to download updates.")
                 return@runOnIO
             }
 
@@ -692,6 +838,14 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
             update { copy(isDownloadingUpdate = false, updateDownloadProgress = 1f, isUpdateDownloaded = true) }
             log("Update downloaded — tap Install to apply")
         }
+    }
+
+    /** Re-downloads the update after a failed install. Resets the downloaded state first. */
+    fun reDownloadUpdate() {
+        if (_state.value.isDownloadingUpdate) return
+        downloadedApk = null
+        update { copy(isUpdateDownloaded = false) }
+        downloadUpdate()
     }
 
     fun installUpdate() {
@@ -708,29 +862,86 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         update { copy(isBusy = true, message = "Preparing install...") }
         runOnIO {
             try {
-                // Use the cached APK directly via FileProvider — no external storage
-                // copy needed (scoped storage on Android 10+ blocks writing to the
-                // root of external storage without MANAGE_EXTERNAL_STORAGE, which
-                // we don't have). The cache-path "updates/" in file_paths.xml
-                // covers cacheDir/updates/ where the APK already lives.
+                val pm = app.packageManager
+
+                // Check 1: does this app have permission to install packages?
+                // On Android 8+ the user must grant "Install unknown apps"
+                // per-app. The RC2 may hide this Settings page — if so, the
+                // user needs to install via SD card + FileManager instead.
+                if (android.os.Build.VERSION.SDK_INT >= 26 && !pm.canRequestPackageInstalls()) {
+                    log("Install blocked — FreeFCC needs 'Install unknown apps' permission.")
+                    log("Opening Settings to grant it. If the Settings page doesn't appear,")
+                    log("install the update via SD card + FileManager instead.")
+                    val settingsIntent = android.content.Intent(
+                        android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES
+                    ).apply {
+                        data = android.net.Uri.parse("package:${app.packageName}")
+                        flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    try {
+                        app.startActivity(settingsIntent)
+                    } catch (_: Exception) {
+                        log("Settings page unavailable — install via SD card + FileManager.")
+                    }
+                    update { copy(isBusy = false, message = "Grant install permission in Settings, then tap Install again. Or install via SD card.") }
+                    return@runOnIO
+                }
+
+                // Copy the APK to a location the installer can access.
+                // The RC2's package installer may not handle content:// URIs
+                // from app-private cacheDir (a known Android issue). Copying
+                // to the app-specific external directory is more reliable.
+                val extDir = java.io.File(app.getExternalFilesDir(null), "updates").apply { mkdirs() }
+                val extFile = java.io.File(extDir, "freefcc_update.apk")
+                try {
+                    file.copyTo(extFile, overwrite = true)
+                } catch (e: Exception) {
+                    log("Could not copy APK to external storage: ${e.message}")
+                    // Fall back to the cache file
+                }
+                val installFile = if (extFile.exists()) extFile else file
+
                 val uri = androidx.core.content.FileProvider.getUriForFile(
-                    app, "${app.packageName}.fileprovider", file
+                    app, "${app.packageName}.fileprovider", installFile
                 )
                 val viewIntent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
                     setDataAndType(uri, "application/vnd.android.package-archive")
                     flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
                             android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
                 }
+
+                // Check 2: does a package installer actually exist?
+                if (viewIntent.resolveActivity(pm) == null) {
+                    log("No package installer found. Sideload 01_PackageInstaller from the SD card, reboot, then retry.")
+                    update { copy(isBusy = false, message = "No installer. Sideload 01_PackageInstaller from SD card, reboot, retry.") }
+                    return@runOnIO
+                }
+
+                // Grant URI permission to all resolved installer activities —
+                // some OEM forks don't honor FLAG_GRANT_READ_URI_PERMISSION
+                // alone for the staging step.
+                val targets = pm.queryIntentActivities(viewIntent, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+                for (info in targets) {
+                    app.grantUriPermission(
+                        info.activityInfo.packageName, uri,
+                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+
                 try {
                     app.startActivity(viewIntent)
                     log("Launching installer...")
-                } catch (_: Exception) {
-                    log("Installer unavailable — try installing via adb or a file manager")
+                    update { copy(isBusy = false, message = "Installer launched — follow the on-screen prompts.") }
+                } catch (e: android.content.ActivityNotFoundException) {
+                    log("No package installer on this device. Install via SD card + FileManager.")
+                    update { copy(isBusy = false, message = "No installer. Install via SD card + FileManager.") }
+                } catch (e: Exception) {
+                    log("Install failed: ${e.message}")
+                    update { copy(isBusy = false, message = "Install failed: ${e.message}") }
                 }
             } catch (e: Exception) {
-                log("Install failed: ${e.message}")
-            } finally {
-                update { copy(isBusy = false) }
+                log("Install error: ${e.message}")
+                update { copy(isBusy = false, message = "Install error: ${e.message}") }
             }
         }
     }
@@ -744,16 +955,39 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         return false
     }
 
-    /** Returns the cached serial, or probes the controller if not yet known. */
+    /**
+     * Resolves the aircraft serial for 4G, in priority order:
+     *   1. A manually-entered serial (always wins).
+     *   2. The serial from this session / a previous session (cache).
+     *   3. An active version/serial query to the aircraft.
+     *   4. A longer passive telemetry listen.
+     * The first non-empty result is cached in SharedPreferences.
+     */
     private fun getOrProbeSerial(): String {
+        // 1. Manual serial takes priority — trust exactly what the user typed,
+        //    whatever the format (do NOT re-validate; they entered it on purpose).
+        val manual = prefs.getString("manual_aircraft_sn", "").orEmpty()
+        if (manual.isNotEmpty()) {
+            update { copy(aircraftSerial = manual) }
+            return manual
+        }
+
+        // 2. Cached from this or a previous session.
         var serial = _state.value.aircraftSerial
-        if (serial.isEmpty()) {
-            log("Probing for aircraft serial...")
-            serial = transport.probeSerial(2000)
-            if (serial.isNotEmpty()) {
-                update { copy(aircraftSerial = serial) }
-                log("Aircraft serial: $serial")
-            }
+        if (serial.isEmpty()) serial = prefs.getString("aircraft_serial", "").orEmpty()
+        if (serial.isNotEmpty()) {
+            update { copy(aircraftSerial = serial) }
+            return serial
+        }
+
+        // 3. Active query, then 4. longer passive listen.
+        log("Reading aircraft serial...")
+        serial = transport.probeSerialActive(800)
+        if (serial.isEmpty()) serial = transport.probeSerial(8000)
+        if (serial.isNotEmpty()) {
+            update { copy(aircraftSerial = serial) }
+            prefs.edit().putString("aircraft_serial", serial).apply()
+            log("Aircraft serial: $serial (cached)")
         }
         return serial
     }

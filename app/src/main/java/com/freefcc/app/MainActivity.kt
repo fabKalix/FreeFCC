@@ -172,6 +172,38 @@ private fun FccPage(state: AppState, viewModel: FccViewModel) {
         AppHeader(state.controllerModel)
         Spacer(Modifier.height(28.dp))
         ConnectionPill(state)
+
+        // Update-available banner — shows on the FCC page so the user
+        // doesn't have to manually check the Update tab.
+        if (state.updateAvailable && state.updateInfo != null && !state.isCheckingUpdate) {
+            Spacer(Modifier.height(16.dp))
+            GlowCard {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Update available — v${state.updateInfo!!.version}",
+                            color = Green, fontSize = 14.sp, fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            "Tap Update to install",
+                            color = TextDim, fontSize = 12.sp
+                        )
+                    }
+                    Icon(
+                        Icons.Filled.NewReleases,
+                        contentDescription = "Update available",
+                        tint = Green,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+            }
+        }
+
         Spacer(Modifier.height(28.dp))
 
         GlowCard {
@@ -280,6 +312,46 @@ private fun FccPage(state: AppState, viewModel: FccViewModel) {
                         else "Sends 4G activation frames to the aircraft. No status is read back — check the DJI Fly app or Cellular Dongle to confirm.",
                         TextGray
                     )
+
+                    Spacer(Modifier.height(16.dp))
+
+                    // Aircraft serial — embedded in every 4G frame. Auto-detect
+                    // (active query, then telemetry) or type it in if detection fails.
+                    var serialField by remember(state.aircraftSerial, state.manualSerial) {
+                        mutableStateOf(state.manualSerial.ifEmpty { state.aircraftSerial })
+                    }
+                    OutlinedTextField(
+                        value = serialField,
+                        onValueChange = { serialField = it.trim() },
+                        label = { Text("Aircraft serial") },
+                        placeholder = { Text("auto-detected, or type it") },
+                        singleLine = true,
+                        enabled = !state.isHardwareBusy,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = TextWhite,
+                            unfocusedTextColor = TextWhite,
+                            focusedBorderColor = Amber,
+                            unfocusedBorderColor = TextGray,
+                            focusedLabelColor = Amber,
+                            unfocusedLabelColor = TextGray,
+                            focusedPlaceholderColor = TextGray,
+                            unfocusedPlaceholderColor = TextGray,
+                            cursorColor = Amber
+                        )
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    GlowButton(
+                        if (state.isProbingSerial) "Reading serial…" else "Read serial from aircraft",
+                        Cyan, filled = false, enabled = !state.isHardwareBusy
+                    ) { viewModel.probeSerial() }
+                    if (serialField.isNotBlank() && serialField != state.manualSerial) {
+                        Spacer(Modifier.height(8.dp))
+                        GlowButton("Use this serial for 4G", Cyan, filled = false, enabled = !state.isHardwareBusy) {
+                            viewModel.setManualSerial(serialField)
+                        }
+                    }
+
                     Spacer(Modifier.height(20.dp))
 
                     if (state.is4gBusy) {
@@ -586,7 +658,7 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
                         color = TextDim, fontSize = 12.sp, lineHeight = 17.sp
                     )
                     Spacer(Modifier.height(20.dp))
-                    GlowButton("Retry", Cyan) { viewModel.checkForUpdates() }
+                    GlowButton("Retry", Cyan) { viewModel.checkForUpdates(force = true) }
                 }
             }
             return@Column
@@ -686,7 +758,7 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
                         }
                         Spacer(Modifier.height(12.dp))
                         GlowButton("Download Again", Cyan, filled = false) {
-                            viewModel.downloadUpdate()
+                            viewModel.reDownloadUpdate()
                         }
                     }
                     else -> {
@@ -695,6 +767,17 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
                         }
                     }
                 }
+            }
+
+            // "Check Again" button — always visible at the bottom of the
+            // update card, whether up-to-date or an update is available.
+            // Uses force=true to bypass the rate-limit so the user can
+            // recheck immediately at any time.
+            Spacer(Modifier.height(20.dp))
+            DividerLine()
+            Spacer(Modifier.height(16.dp))
+            GlowButton("Check Again", Cyan, filled = false) {
+                viewModel.checkForUpdates(force = true)
             }
         }
     }
